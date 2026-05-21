@@ -1,0 +1,1 @@
+ALTER TABLE vendor_organizations ADD COLUMN IF NOT EXISTS is_partner BOOLEAN DEFAULT FALSE;

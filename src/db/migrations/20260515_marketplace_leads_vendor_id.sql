@@ -1,0 +1,2 @@
+-- Reference: marketplace lead tables use vendor_id (users.id) for the shopper / Botch participant.
+-- Applied idempotently by backend/src/db/migrate.js (PostgreSQL) and backend/src/db/sqlite.js (SQLite).
