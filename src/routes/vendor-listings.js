@@ -20,6 +20,8 @@ import {
   legacyPlanSlugFromDays,
   resolveFeaturedDurationDays,
 } from '../lib/vendor-featured-plans.js';
+import { sqlConflictDoNothing, sqlConflictDoUpdate, sqlInsertVerb } from '../lib/upsert-sql.js';
+import { isMysqlDatabase } from '../lib/db-dialect.js';
 
 const router = express.Router();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,6 +41,25 @@ const vendorListingUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: fileFilter(ALLOWED_IMAGE_MIMES, 'Vendor listing image'),
 });
+
+/** Persist listing image to S3 or local uploads; works with memory or disk multer storage. */
+async function saveVendorListingImageFile(file) {
+  const ext = (path.extname(file.originalname || '') || '.bin').toLowerCase();
+  if (isS3Configured() && file.buffer?.length) {
+    const key = `vendor-listings/${uuidv4()}${ext}`;
+    const s3Url = await uploadToS3(file.buffer, key, file.mimetype || 'application/octet-stream');
+    if (s3Url) return s3Url;
+  }
+  if (file.filename) {
+    return `/uploads/vendor-listings/${file.filename}`;
+  }
+  if (file.buffer?.length) {
+    const filename = `vendor-listing-${uuidv4()}${ext}`;
+    fs.writeFileSync(path.join(vendorListingsDir, filename), file.buffer);
+    return `/uploads/vendor-listings/${filename}`;
+  }
+  return null;
+}
 
 function canManageListing(role, userId, row) {
   if (['admin', 'super_admin', 'vendor_admin', 'finance_admin', 'moderator', 'editor'].includes(role)) return true;
@@ -701,31 +722,52 @@ router.post(
         return res.status(400).json({ error: 'You cannot report your own review.' });
       }
 
+      const reportConflict = sqlConflictDoNothing('(review_id, reporter_user_id)');
       await pool.query(
-        `INSERT INTO vendor_review_reports (id, review_id, reporter_user_id, reason)
+        `${sqlInsertVerb()} INTO vendor_review_reports (id, review_id, reporter_user_id, reason)
          VALUES ($1, $2, $3, $4)
-         ON CONFLICT (review_id, reporter_user_id) DO NOTHING`,
+         ${reportConflict}`,
         [uuidv4(), reviewId, req.userId, req.body.reason || null]
       );
 
-      await pool.query(
-        `UPDATE vendor_reviews vr
-         SET reports_count = sub.report_count,
-             moderation_status = CASE
-               WHEN COALESCE(vr.moderation_status, 'visible') = 'hidden' THEN 'hidden'
-               WHEN sub.report_count >= 2 THEN 'flagged'
-               ELSE COALESCE(vr.moderation_status, 'visible')
-             END,
-             updated_at = CURRENT_TIMESTAMP
-         FROM (
-           SELECT review_id, COUNT(*) AS report_count
-           FROM vendor_review_reports
-           WHERE review_id = $1
-           GROUP BY review_id
-         ) sub
-         WHERE vr.id = sub.review_id`,
-        [reviewId]
-      );
+      if (await isMysqlDatabase()) {
+        await pool.query(
+          `UPDATE vendor_reviews vr
+           INNER JOIN (
+             SELECT review_id, COUNT(*) AS report_count
+             FROM vendor_review_reports
+             WHERE review_id = $1
+             GROUP BY review_id
+           ) sub ON vr.id = sub.review_id
+           SET vr.reports_count = sub.report_count,
+               vr.moderation_status = CASE
+                 WHEN COALESCE(vr.moderation_status, 'visible') = 'hidden' THEN 'hidden'
+                 WHEN sub.report_count >= 2 THEN 'flagged'
+                 ELSE COALESCE(vr.moderation_status, 'visible')
+               END,
+               vr.updated_at = CURRENT_TIMESTAMP`,
+          [reviewId]
+        );
+      } else {
+        await pool.query(
+          `UPDATE vendor_reviews vr
+           SET reports_count = sub.report_count,
+               moderation_status = CASE
+                 WHEN COALESCE(vr.moderation_status, 'visible') = 'hidden' THEN 'hidden'
+                 WHEN sub.report_count >= 2 THEN 'flagged'
+                 ELSE COALESCE(vr.moderation_status, 'visible')
+               END,
+               updated_at = CURRENT_TIMESTAMP
+           FROM (
+             SELECT review_id, COUNT(*) AS report_count
+             FROM vendor_review_reports
+             WHERE review_id = $1
+             GROUP BY review_id
+           ) sub
+           WHERE vr.id = sub.review_id`,
+          [reviewId]
+        );
+      }
 
       return res.status(201).json({ ok: true, message: 'Thanks. This review was reported for moderation.' });
     } catch (err) {
@@ -778,11 +820,14 @@ router.post(
       }
 
       const id = uuidv4();
+      const reviewUpsert = sqlConflictDoUpdate(
+        '(vendor_profile_id, vendor_profile_type, reviewer_user_id)',
+        'rating = excluded.rating, comment = excluded.comment, updated_at = CURRENT_TIMESTAMP'
+      );
       await pool.query(
         `INSERT INTO vendor_reviews (id, vendor_profile_id, vendor_profile_type, reviewer_user_id, rating, comment)
          VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (vendor_profile_id, vendor_profile_type, reviewer_user_id)
-         DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, updated_at = CURRENT_TIMESTAMP`,
+         ${reviewUpsert}`,
         [id, vendorId, vendorType, req.userId, Number(req.body.rating), req.body.comment || null]
       );
 
@@ -1084,14 +1129,9 @@ router.post(
         if (!mod.ok) return res.status(403).json({ error: mod.error });
       }
 
-      let mediaUrl = null;
-      if (isS3Configured()) {
-        const ext = (path.extname(req.file.originalname || '') || '.bin').toLowerCase();
-        const key = `vendor-listings/${uuidv4()}${ext}`;
-        mediaUrl = await uploadToS3(req.file.buffer, key, req.file.mimetype || 'application/octet-stream');
-      }
+      const mediaUrl = await saveVendorListingImageFile(req.file);
       if (!mediaUrl) {
-        mediaUrl = `/uploads/vendor-listings/${req.file.filename}`;
+        return res.status(500).json({ error: 'Image could not be saved. Try again or contact support.' });
       }
 
       return res.status(201).json({

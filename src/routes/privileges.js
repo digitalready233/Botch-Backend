@@ -12,6 +12,7 @@ import {
 } from '../lib/permissions.js';
 import { v4 as uuidv4 } from 'uuid';
 import { logAudit } from '../lib/audit.js';
+import { sqlConflictDoUpdate } from '../lib/upsert-sql.js';
 
 const router = express.Router();
 
@@ -60,11 +61,14 @@ router.patch(
       }
 
       const rowId = uuidv4();
+      const permUpsert = sqlConflictDoUpdate(
+        '(role, permission_key)',
+        'is_enabled = excluded.is_enabled, updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP'
+      );
       await pool.query(
         `INSERT INTO role_permissions (id, role, permission_key, is_enabled, updated_by, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-         ON CONFLICT(role, permission_key)
-         DO UPDATE SET is_enabled = excluded.is_enabled, updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP`,
+         ${permUpsert}`,
         [rowId, role, permission, enabled ? 1 : 0, req.userId]
       );
 

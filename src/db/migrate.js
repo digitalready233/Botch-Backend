@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import pool from './index.js';
+import { getDbKind } from './index.js';
+import { applySqlFile } from './apply-mysql-sql.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -12,6 +14,13 @@ function isSqliteError(err) {
 }
 
 export async function migrate() {
+  if (getDbKind() === 'mysql') {
+    await applySqlFile('schema.mysql.sql');
+    await runPostMigrateCommon();
+    console.log('MySQL schema applied successfully.');
+    return;
+  }
+
   const schemaPath = path.join(__dirname, 'schema.sql');
   let usedPgSchema = false;
 
@@ -636,7 +645,10 @@ export async function migrate() {
   }
 
   console.log('Database schema applied successfully.');
+  await runPostMigrateCommon();
+}
 
+async function runPostMigrateCommon() {
   // Both: ensure at least one super_admin exists
   try {
     const { rows: superRows } = await pool.query("SELECT id FROM users WHERE role = 'super_admin' LIMIT 1");

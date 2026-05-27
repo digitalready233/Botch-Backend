@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { body, param, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
 import pool from '../db/index.js';
+import { sqlConflictDoUpdate } from '../lib/upsert-sql.js';
 import { authMiddleware, requireAdmin } from '../middleware/auth.js';
 import { logAudit } from '../lib/audit.js';
 import { moduleFlagToDb, moduleFlagsForSignupVendorChannel } from '../lib/vendor-org-modules.js';
@@ -835,13 +836,16 @@ router.post(
       const { rows: userRows } = await pool.query("SELECT id, role FROM users WHERE id = $1 AND role = 'vendor'", [userId]);
       if (!userRows.length) return res.status(400).json({ error: 'User must have vendor role' });
 
+      const memberUpsert = sqlConflictDoUpdate(
+        '(vendor_org_id, user_id)',
+        `org_role = excluded.org_role,
+           is_primary_contact = excluded.is_primary_contact,
+           updated_at = CURRENT_TIMESTAMP`
+      );
       await pool.query(
         `INSERT INTO vendor_memberships (id, vendor_org_id, user_id, org_role, is_primary_contact)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (vendor_org_id, user_id) DO UPDATE SET
-           org_role = EXCLUDED.org_role,
-           is_primary_contact = EXCLUDED.is_primary_contact,
-           updated_at = CURRENT_TIMESTAMP`,
+         ${memberUpsert}`,
         [uuidv4(), vendorOrgId, userId, orgRole, isPrimaryContact]
       );
 

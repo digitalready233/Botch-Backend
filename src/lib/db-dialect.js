@@ -1,9 +1,12 @@
 import pool from '../db/index.js';
+import { getDbKind } from '../db/index.js';
 
 let _sqliteCache;
 
-/** True when the app database is SQLite (not PostgreSQL). */
+/** True when the app database is SQLite (not PostgreSQL or MySQL). */
 export async function isSqliteDatabase() {
+  if (getDbKind() === 'sqlite') return true;
+  if (getDbKind() === 'mysql') return false;
   if (_sqliteCache !== undefined) return _sqliteCache;
   try {
     const { rows } = await pool.query('SELECT sqlite_version() AS v');
@@ -14,9 +17,12 @@ export async function isSqliteDatabase() {
   return _sqliteCache;
 }
 
+export async function isMysqlDatabase() {
+  return getDbKind() === 'mysql';
+}
+
 /**
  * Scalar subquery that returns a JSON array of gallery URLs for property row `p`.
- * PostgreSQL: json_agg + ::json. SQLite: json_group_array (text JSON).
  */
 export async function sqlPropertyGalleryUrlsSubquery() {
   if (await isSqliteDatabase()) {
@@ -30,6 +36,16 @@ export async function sqlPropertyGalleryUrlsSubquery() {
         )),
         '[]'
       )
+    )`;
+  }
+  if (await isMysqlDatabase()) {
+    return `(
+      SELECT COALESCE(
+        JSON_ARRAYAGG(pi.file_url ORDER BY pi.sort_order ASC, pi.created_at ASC),
+        JSON_ARRAY()
+      )
+      FROM property_images pi
+      WHERE pi.property_id = p.id
     )`;
   }
   return `(

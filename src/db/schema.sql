@@ -735,7 +735,6 @@ CREATE TABLE IF NOT EXISTS house_plans (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-ALTER TABLE house_plans ADD COLUMN IF NOT EXISTS owner_architect_id UUID REFERENCES users(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_house_plans_slug ON house_plans(slug);
 CREATE INDEX IF NOT EXISTS idx_house_plans_publish_status ON house_plans(publish_status);
 CREATE INDEX IF NOT EXISTS idx_house_plans_featured ON house_plans(featured);

@@ -1,20 +1,32 @@
 import dotenv from 'dotenv';
-import pool from './sqlite.js';
+import { isMysqlUrl } from './sql-utils.js';
 
 dotenv.config();
 
-// Wrapper to match the expected pg interface
+const useMysql = isMysqlUrl((process.env.DATABASE_URL || '').trim());
+
+let poolImpl;
+if (useMysql) {
+  poolImpl = (await import('./mysql.js')).default;
+} else {
+  poolImpl = (await import('./sqlite.js')).default;
+}
+
+/** @returns {'mysql' | 'sqlite'} */
+export function getDbKind() {
+  return useMysql ? 'mysql' : 'sqlite';
+}
+
 const poolWrapper = {
   query: (text, params) => {
-    return new Promise((resolve, reject) => {
-      try {
-        const res = pool.query(text, params);
-        resolve(res);
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
+    return Promise.resolve().then(() => poolImpl.query(text, params));
+  },
+  getConnection: () => {
+    if (typeof poolImpl.getConnection === 'function') {
+      return poolImpl.getConnection();
+    }
+    return null;
+  },
 };
 
 export default poolWrapper;

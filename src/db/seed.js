@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import pool from './index.js';
+import { sqlInsertVerb, sqlConflictDoNothing } from '../lib/upsert-sql.js';
 
 const __filename = fileURLToPath(import.meta.url);
 
@@ -12,19 +13,21 @@ export async function seed() {
   const clientEmail = 'client@example.com';
   const passwordHash = await bcrypt.hash('Password123!', SALT_ROUNDS);
 
+  const emailConflict = sqlConflictDoNothing('(email)');
   await pool.query(`
-    INSERT INTO users (id, email, password_hash, full_name, role, verified)
+    ${sqlInsertVerb()} INTO users (id, email, password_hash, full_name, role, verified)
     VALUES 
       ('a0000000-0000-0000-0000-000000000001', $1, $2, 'Botch Admin', 'super_admin', true),
       ('a0000000-0000-0000-0000-000000000002', $3, $2, 'Diaspora Client', 'client', true)
-    ON CONFLICT (email) DO NOTHING
+    ${emailConflict}
   `, [adminEmail, passwordHash, clientEmail]);
 
+  const projectConflict = sqlConflictDoNothing('(id)');
   await pool.query(`
-    INSERT INTO projects (id, client_id, name, location, package_type, total_cost, amount_paid, progress_percent, status, start_date, estimated_completion)
+    ${sqlInsertVerb()} INTO projects (id, client_id, name, location, package_type, total_cost, amount_paid, progress_percent, status, start_date, estimated_completion)
     VALUES 
       ('b0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', 'East Legon 3BR Villa', 'East Legon, Accra', '3BR Villa', 185000, 46000, 28, 'active', '2024-06-01', '2025-06-01')
-    ON CONFLICT (id) DO NOTHING
+    ${projectConflict}
   `);
 
   const { rows: projRows } = await pool.query('SELECT id FROM projects WHERE id = $1', ['b0000000-0000-0000-0000-000000000001']);

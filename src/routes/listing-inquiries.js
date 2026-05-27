@@ -10,6 +10,7 @@ import { publicPropertyFilterSql } from '../lib/listing-state.js';
 import { LEAD_STATUS_VALUES } from '../lib/lead-status.js';
 import { resolveListingAgentId } from '../lib/property-agent.js';
 import { isCustomerRole } from '../lib/roles.js';
+import { sqlConflictDoUpdate } from '../lib/upsert-sql.js';
 
 const router = express.Router();
 
@@ -81,14 +82,17 @@ router.post(
         return res.status(503).json({ error: 'No agent is available to assign this lead. Please contact support.' });
       }
       const id = uuidv4();
+      const inquiryUpsert = sqlConflictDoUpdate(
+        '(property_id, vendor_id)',
+        `message = COALESCE(excluded.message, message),
+           lead_status = 'new',
+           assigned_to = excluded.assigned_to,
+           updated_at = CURRENT_TIMESTAMP`
+      );
       await pool.query(
         `INSERT INTO listing_inquiries (id, property_id, vendor_id, message, lead_status, assigned_to, updated_at)
          VALUES ($1, $2, $3, $4, 'new', $5, CURRENT_TIMESTAMP)
-         ON CONFLICT(property_id, vendor_id) DO UPDATE SET
-           message = COALESCE(excluded.message, message),
-           lead_status = 'new',
-           assigned_to = excluded.assigned_to,
-           updated_at = CURRENT_TIMESTAMP`,
+         ${inquiryUpsert}`,
         [id, property_id, req.userId, message || null, agentId]
       );
 
@@ -152,14 +156,17 @@ router.post(
       let leadId = null;
       if (authUser?.userId && isCustomerRole(authUser.userRole) && agentId) {
         const newId = uuidv4();
+        const contactUpsert = sqlConflictDoUpdate(
+          '(property_id, vendor_id)',
+          `message = COALESCE(excluded.message, message),
+             lead_status = 'new',
+             assigned_to = excluded.assigned_to,
+             updated_at = CURRENT_TIMESTAMP`
+        );
         await pool.query(
           `INSERT INTO listing_inquiries (id, property_id, vendor_id, message, lead_status, assigned_to, updated_at)
            VALUES ($1, $2, $3, $4, 'new', $5, CURRENT_TIMESTAMP)
-           ON CONFLICT(property_id, vendor_id) DO UPDATE SET
-             message = COALESCE(excluded.message, message),
-             lead_status = 'new',
-             assigned_to = excluded.assigned_to,
-             updated_at = CURRENT_TIMESTAMP`,
+           ${contactUpsert}`,
           [newId, property_id, authUser.userId, message, agentId]
         );
         const { rows: idRows } = await pool.query(

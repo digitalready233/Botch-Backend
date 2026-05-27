@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../db/index.js';
+import { sqlConflictDoUpdate } from '../lib/upsert-sql.js';
 import { authMiddleware, requireAdmin } from '../middleware/auth.js';
 import { body, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
@@ -42,9 +43,10 @@ router.put('/preferences', authMiddleware, [
     if (proj.length === 0) return res.status(404).json({ error: 'Project not found' });
     if (!canAccessProject(req.userRole, req.userId, proj[0])) return res.status(403).json({ error: "You don't have permission to access this." });
 
+    const prefUpsert = sqlConflictDoUpdate('(project_id, user_id)', 'send_weekly_email = excluded.send_weekly_email');
     await pool.query(
       `INSERT INTO project_report_preferences (project_id, user_id, send_weekly_email) VALUES ($1, $2, $3)
-       ON CONFLICT(project_id, user_id) DO UPDATE SET send_weekly_email = $3`,
+       ${prefUpsert}`,
       [project_id, req.userId, send_weekly_email !== false ? 1 : 0]
     );
     const { rows } = await pool.query(

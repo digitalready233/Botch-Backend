@@ -1,6 +1,6 @@
 import express from 'express';
 import pool from '../db/index.js';
-import { db } from '../db/sqlite.js';
+import { deleteUserById } from '../lib/delete-user.js';
 import { authMiddleware, requireAdmin, requireSuperAdmin, loadUser } from '../middleware/auth.js';
 import { body, validationResult, query } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
@@ -366,27 +366,7 @@ router.delete('/:id', authMiddleware, requireAdmin, async (req, res, next) => {
       return res.status(403).json({ error: 'Can only delete client, buyer, or agent accounts; super admin can also delete admin-class roles' });
     }
 
-    const deleteUser = db.transaction((userId) => {
-      const msgIds = db.prepare(
-        'SELECT id FROM messages WHERE sender_id = ? OR recipient_id = ?'
-      ).all(userId, userId).map((r) => r.id);
-      if (msgIds.length > 0) {
-        const placeholders = msgIds.map(() => '?').join(',');
-        db.prepare(
-          `DELETE FROM message_attachments WHERE message_id IN (${placeholders})`
-        ).run(...msgIds);
-        db.prepare(
-          'DELETE FROM messages WHERE sender_id = ? OR recipient_id = ?'
-        ).run(userId, userId);
-      }
-      db.prepare('UPDATE media SET uploaded_by = NULL WHERE uploaded_by = ?').run(userId);
-      try { db.prepare('UPDATE project_documents SET uploaded_by = NULL WHERE uploaded_by = ?').run(userId); } catch (_) {}
-      try { db.prepare('UPDATE kyc_documents SET reviewed_by = NULL WHERE reviewed_by = ?').run(userId); } catch (_) {}
-      try { db.prepare('UPDATE audit_logs SET user_id = NULL WHERE user_id = ?').run(userId); } catch (_) {}
-      db.prepare('DELETE FROM users WHERE id = ?').run(userId);
-    });
-
-    deleteUser(targetId);
+    await deleteUserById(targetId);
 
     logAudit({
       userId: req.userId,

@@ -670,7 +670,11 @@ app.use((err, req, res, next) => {
   const isUploadReject =
     err.message &&
     (err.message.includes("only allowed file types") ||
-      err.code === "LIMIT_FILE_SIZE");
+      err.message.includes("Vendor listing image") ||
+      err.message.includes("Branding image") ||
+      err.message.includes("Media upload") ||
+      err.code === "LIMIT_FILE_SIZE" ||
+      err.name === "MulterError");
   const status = err.status || (isUploadReject ? 400 : 500);
   const message = toUserFriendlyMessage(err.message, status, isProduction);
   // Ensure security headers are set on error responses (status code indicates error)

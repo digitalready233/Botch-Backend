@@ -1,0 +1,243 @@
+/**
+ * Export data from backend/botch.db (SQLite) → seed.mysql.sql for Hostinger / phpMyAdmin.
+ *
+ * Run from backend:
+ *   node scripts/export-sqlite-to-mysql-seed.mjs
+ *   node scripts/export-sqlite-to-mysql-seed.mjs --db path/to/other.db
+ *
+ * Requires schema.mysql.sql applied first. Uses INSERT IGNORE (safe to re-run).
+ */
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import Database from 'better-sqlite3';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const backendDir = path.join(__dirname, '..');
+
+const args = process.argv.slice(2);
+const dbArg = args.find((a) => a.startsWith('--db='));
+const dbPath = dbArg
+  ? path.resolve(dbArg.slice(5))
+  : path.join(backendDir, 'botch.db');
+const schemaPath = path.join(backendDir, 'src/db/schema.mysql.sql');
+const outSeed = path.join(backendDir, 'src/db/seed.mysql.sql');
+const outPhpMyAdmin = path.join(backendDir, 'src/db/seed.mysql.phpmyadmin.sql');
+
+const MYSQL_RESERVED = new Set(['role', 'interval']);
+const BATCH_SIZE = 80;
+
+function quoteColumn(name) {
+  return MYSQL_RESERVED.has(name) ? `\`${name}\`` : name;
+}
+
+/** SQLite migrations sometimes store 'CURRENT_TIMESTAMP' or 'basic' with extra quote characters. */
+function normalizeSqliteValue(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  const unquoted = trimmed.replace(/^'+|'+$/g, '');
+  if (/^CURRENT_TIMESTAMP$/i.test(unquoted)) return null;
+  if (unquoted !== trimmed && !unquoted.includes("'")) return unquoted;
+  return value;
+}
+
+function escapeSqlValue(value) {
+  value = normalizeSqliteValue(value);
+  if (value === null || value === undefined) return 'NULL';
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? String(value) : 'NULL';
+  }
+  if (typeof value === 'bigint') return String(value);
+  if (Buffer.isBuffer(value)) return `X'${value.toString('hex')}'`;
+  if (typeof value === 'boolean') return value ? '1' : '0';
+  const s = String(value);
+  if (s === '') return "''";
+  return `'${s.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
+}
+
+/** Parse CREATE TABLE blocks from schema.mysql.sql → ordered table names + column names. */
+function parseMysqlSchema(sql) {
+  const tableOrder = [];
+  const columnsByTable = new Map();
+  const re = /CREATE TABLE IF NOT EXISTS (\w+) \(([\s\S]*?)^\);/gm;
+  let m;
+  while ((m = re.exec(sql)) !== null) {
+    const table = m[1];
+    const body = m[2];
+    const cols = [];
+    for (const line of body.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('--')) continue;
+      if (
+        /^(CONSTRAINT|PRIMARY KEY|UNIQUE|FOREIGN KEY|CHECK|KEY )/i.test(trimmed)
+      ) {
+        continue;
+      }
+      const colMatch = trimmed.match(/^(`\w+`|\w+)\s/);
+      if (colMatch) {
+        const raw = colMatch[1].replace(/`/g, '');
+        cols.push(raw);
+      }
+    }
+    if (cols.length) {
+      tableOrder.push(table);
+      columnsByTable.set(table, cols);
+    }
+  }
+  let pendingAlterTable = null;
+  for (const line of sql.split('\n')) {
+    const tableOnLine = line.match(/^ALTER TABLE (\w+)\b/i);
+    if (tableOnLine) pendingAlterTable = tableOnLine[1];
+    const addCol = line.match(/ADD COLUMN (?:IF NOT EXISTS )?(`\w+`|\w+)\b/i);
+    if (addCol && pendingAlterTable && columnsByTable.has(pendingAlterTable)) {
+      const col = addCol[1].replace(/`/g, '');
+      const cols = columnsByTable.get(pendingAlterTable);
+      if (!cols.includes(col)) cols.push(col);
+    }
+    if (line.trim().endsWith(';')) pendingAlterTable = null;
+  }
+
+  return { tableOrder, columnsByTable };
+}
+
+function sqliteTableNames(db) {
+  return db
+    .prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`
+    )
+    .all()
+    .map((r) => r.name);
+}
+
+function sqliteColumns(db, table) {
+  return db
+    .prepare(`PRAGMA table_info(${table})`)
+    .all()
+    .map((c) => c.name);
+}
+
+function buildInsertStatements(table, columns, rows) {
+  if (!rows.length) return [];
+  const colList = columns.map(quoteColumn).join(', ');
+  const statements = [];
+  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+    const chunk = rows.slice(i, i + BATCH_SIZE);
+    const valueRows = chunk.map((row) => {
+      const vals = columns.map((col) => escapeSqlValue(row[col]));
+      return `(${vals.join(', ')})`;
+    });
+    statements.push(
+      `INSERT IGNORE INTO ${table} (${colList})\nVALUES\n  ${valueRows.join(',\n  ')};`
+    );
+  }
+  return statements;
+}
+
+function toPhpMyAdminFile(statements) {
+  const header = `-- Botch — Hostinger phpMyAdmin seed (exported from SQLite)
+-- Apply after schema.mysql.phpmyadmin.sql (or schema.mysql.sql).
+-- Idempotent: INSERT IGNORE. Re-run safe.
+--
+-- Generated by scripts/export-sqlite-to-mysql-seed.mjs from ${path.basename(dbPath)}
+
+SET NAMES utf8mb4;
+SET FOREIGN_KEY_CHECKS = 0;
+
+`;
+
+  const blocks = statements.map((stmt, i) => {
+    const oneLine = stmt.replace(/\s+/g, ' ').trim();
+    const label = oneLine.slice(0, 72);
+    return `-- [${i + 1}/${statements.length}] ${label}${label.length < oneLine.length ? '…' : ''}\n${stmt}`;
+  });
+
+  return `${header}${blocks.join('\n\n')}\n\nSET FOREIGN_KEY_CHECKS = 1;\n`;
+}
+
+function main() {
+  if (!fs.existsSync(dbPath)) {
+    console.error('SQLite database not found:', dbPath);
+    process.exit(1);
+  }
+  if (!fs.existsSync(schemaPath)) {
+    console.error('Missing', schemaPath, '— run: node scripts/generate-schema-mysql.mjs');
+    process.exit(1);
+  }
+
+  const schemaSql = fs.readFileSync(schemaPath, 'utf8');
+  const { tableOrder, columnsByTable } = parseMysqlSchema(schemaSql);
+  const db = new Database(dbPath, { readonly: true });
+  const sqliteTables = new Set(sqliteTableNames(db));
+
+  const header = `-- Botch — MySQL seed exported from SQLite (${path.basename(dbPath)})
+-- Generated: ${new Date().toISOString()}
+-- Apply after schema.mysql.sql (phpMyAdmin: schema.mysql.phpmyadmin.sql then this file).
+-- Idempotent: INSERT IGNORE. Password hashes and data match your local botch.db.
+--
+-- Regenerate:
+--   node scripts/export-sqlite-to-mysql-seed.mjs
+
+SET NAMES utf8mb4;
+SET FOREIGN_KEY_CHECKS = 0;
+
+`;
+
+  const lines = [header.trimEnd(), ''];
+  const allStatements = [];
+  const skipped = { sqliteOnly: [], empty: [], noColumns: [] };
+  let totalRows = 0;
+
+  for (const table of tableOrder) {
+    if (!sqliteTables.has(table)) continue;
+    const mysqlCols = columnsByTable.get(table) || [];
+    const sqliteCols = new Set(sqliteColumns(db, table));
+    const cols = mysqlCols.filter((c) => sqliteCols.has(c));
+    if (!cols.length) {
+      skipped.noColumns.push(table);
+      continue;
+    }
+    const count = db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get().n;
+    if (count === 0) {
+      skipped.empty.push(table);
+      continue;
+    }
+    const rows = db.prepare(`SELECT ${cols.map((c) => `"${c}"`).join(', ')} FROM "${table}"`).all();
+    totalRows += rows.length;
+    lines.push(`-- ${table} (${rows.length} row${rows.length === 1 ? '' : 's'})`);
+    const inserts = buildInsertStatements(table, cols, rows);
+    lines.push(...inserts, '');
+    allStatements.push(...inserts);
+  }
+
+  for (const t of sqliteTableNames(db)) {
+    if (!columnsByTable.has(t)) skipped.sqliteOnly.push(t);
+  }
+
+  lines.push('SET FOREIGN_KEY_CHECKS = 1;', '');
+  if (skipped.sqliteOnly.length) {
+    lines.splice(
+      1,
+      0,
+      `-- SQLite-only tables (not in schema.mysql.sql): ${skipped.sqliteOnly.join(', ')}`,
+      ''
+    );
+  }
+
+  fs.writeFileSync(outSeed, lines.join('\n'));
+  fs.writeFileSync(outPhpMyAdmin, toPhpMyAdminFile(allStatements));
+
+  db.close();
+
+  console.log('Wrote', outSeed);
+  console.log('Wrote', outPhpMyAdmin);
+  console.log(
+    `Exported ${totalRows} rows across ${allStatements.length} INSERT batch(es); skipped ${skipped.empty.length} empty table(s).`
+  );
+  if (skipped.sqliteOnly.length) {
+    console.log('Skipped SQLite-only tables:', skipped.sqliteOnly.join(', '));
+  }
+}
+
+main();

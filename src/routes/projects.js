@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../db/index.js';
+import { sqlConflictDoUpdate } from '../lib/upsert-sql.js';
 import { createNotificationForUser } from '../lib/notifications.js';
 import { authMiddleware, requireAdmin } from '../middleware/auth.js';
 import { body, validationResult, query } from 'express-validator';
@@ -531,12 +532,15 @@ router.patch('/:id/vendor-assignment', authMiddleware, requireAdmin, [
     }
 
     if (vendor_org_id && vendor_id) {
+      const membershipUpsert = sqlConflictDoUpdate(
+        '(vendor_org_id, user_id)',
+        `is_primary_contact = excluded.is_primary_contact,
+           updated_at = CURRENT_TIMESTAMP`
+      );
       await pool.query(
         `INSERT INTO vendor_memberships (id, vendor_org_id, user_id, org_role, is_primary_contact)
          VALUES ($1, $2, $3, 'member', 1)
-         ON CONFLICT (vendor_org_id, user_id) DO UPDATE SET
-           is_primary_contact = EXCLUDED.is_primary_contact,
-           updated_at = CURRENT_TIMESTAMP`,
+         ${membershipUpsert}`,
         [uuidv4(), vendor_org_id, vendor_id]
       );
 
